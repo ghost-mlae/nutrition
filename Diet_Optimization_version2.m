@@ -150,26 +150,17 @@ environmental_impact = csvread('environmental_impact.csv', 1, 1); % Skip header 
 disp('Environmental impact data loaded.');
 
 % 定义优化变量范围
-lb = zeros(1, num_food_types); % 下界：不能小于 0
-ub = inf(1, num_food_types);   % 上界：文化可接受性范围
-for food = 1:num_food_types
-    lb(food) = acceptability_range(:, food, 1); % 文化下界
-    ub(food) = acceptability_range(:, food, 2); % 文化上界
-end
+lb = reshape(acceptability_range(:, :, 1), 1, []); % 展平成 1-D 向量
+ub = reshape(acceptability_range(:, :, 2), 1, []); % 展平成 1-D 向量
 
 % 多目标优化：定义目标函数
-objective = @(x) [
-    sum((x - Q_obs).^2);          % 目标 1：饮食偏差
-    sum(x .* price_weights);      % 目标 2：环境足迹
-    sum((nutrition_content * x) .* economic_weights); % 目标 3：经济权重
-    sum(max(0, x - acceptability_range(:, :, 2)).^2 + ...
-        max(0, acceptability_range(:, :, 1) - x).^2) % 目标 4：文化可接受性
-];
+objective = @(x) multi_objective_function(x, num_years, num_food_types, Q_obs, ...
+    nutrition_content, economic_weights, price_weights, acceptability_range);
 
 % 非线性约束：营养和环境约束
 nonlin_constraints = @(x) nonlinear_constraints_with_culture(x, num_years, ...
     Q_obs, nutrition_content, nutrition_constraints, environmental_impact, ...
-    environmental_limits, acceptability_limits, num_countries, num_nutrients);
+    environmental_limits, acceptability_range, historical_change, num_countries, num_food_types);
 
 % 使用 gamultiobj 参数
 options = optimoptions('gamultiobj', ...
@@ -180,7 +171,7 @@ options = optimoptions('gamultiobj', ...
 
 % 调用 gamultiobj
 disp('Starting optimization...');
-[x_opt, fval] = gamultiobj(objective, num_food_types, [], [], [], [], lb, ub, nonlin_constraints, options);
+[x_opt, fval] = gamultiobj(objective, numel(lb), [], [], [], [], lb, ub, nonlin_constraints, options);
 disp('Optimization completed.');
 
 % 绘制帕累托前沿
@@ -191,6 +182,41 @@ ylabel('Objective 2: Environmental Impact');
 title('Pareto Front');
 grid on;
 
+function f = multi_objective_function(x, num_years, num_food_types, Q_obs, ...
+    nutrition_content, economic_weights, price_weights, acceptability_range)
+
+    % 将 x 解析为多年的饮食数据
+    Q_opt = reshape(x, num_years, num_food_types);
+
+    % 初始化目标值
+    diet_deviation = 0;
+    environmental_impact = 0;
+    economic_cost = 0;
+    cultural_acceptability = 0;
+
+    % 逐年计算目标值
+    for t = 1:num_years
+        Q_t = Q_opt(t, :);
+
+        % 目标 1：饮食偏差
+        diet_deviation = diet_deviation + sum((Q_t - Q_obs).^2);
+
+        % 目标 2：环境足迹
+        environmental_impact = environmental_impact + sum(Q_t .* price_weights);
+
+        % 目标 3：经济权重
+        economic_cost = economic_cost + sum((nutrition_content * Q_t) .* economic_weights);
+
+        % 目标 4：文化可接受性
+        cultural_acceptability = cultural_acceptability + ...
+            sum(max(0, Q_t - acceptability_range(:, :, 2)).^2 + ...
+                max(0, acceptability_range(:, :, 1) - Q_t).^2);
+    end
+
+    % 返回 4 个目标的值
+    f = [diet_deviation, environmental_impact, economic_cost, cultural_acceptability];
+end
+
 function [c, ceq] = nonlinear_constraints_with_culture(x, num_years, ...
     Q_obs, nutrition_content, nutrition_constraints, environmental_impact, ...
     environmental_limits, acceptability_range, historical_change, num_countries, num_food_types)
@@ -199,9 +225,8 @@ function [c, ceq] = nonlinear_constraints_with_culture(x, num_years, ...
     c = [];
     ceq = [];
 
-    % 解析输入变量
-    % x 是一个 1-D 向量，需要将其解析为多年的数据
-    Q_opt = reshape(x, num_years, num_food_types); % 每年食品消费量
+    % 将 x 转换为二维形式
+    Q_opt = reshape(x, num_years, num_food_types);
 
     % 遍历每年，逐年检查约束
     for t = 1:num_years
@@ -218,32 +243,13 @@ function [c, ceq] = nonlinear_constraints_with_culture(x, num_years, ...
 
         %% Cultural Acceptability Constraints: 文化可接受性约束
         c_acceptability = [
-            Q_t - acceptability_range(:, :, 2); ... % 超出文化上界
-            acceptability_range(:, :, 1) - Q_t];   % 低于文化下界
-
-        %% Historical Change Constraints: 历史变化率约束
-        if t > 1
-            c_historical = [];
-            for food = 1:num_food_types
-                if Q_obs(food) > 0
-                    change_rate = (Q_t(food) - Q_obs(food)) / Q_obs(food);
-                    c_historical = [
-                        c_historical; 
-                        change_rate - historical_change(:, food, 2); ... % 超出最大变化率
-                        historical_change(:, food, 1) - change_rate];   % 低于最小变化率
-                else
-                    c_historical = [c_historical; 0; 0];
-                end
-            end
-        else
-            c_historical = [];
-        end
+            Q_t - reshape(acceptability_range(:, :, 2), 1, []); ... % 超出文化上界
+            reshape(acceptability_range(:, :, 1), 1, []) - Q_t];   % 低于文化下界
 
         %% Combine all constraints
-        c = [c; c_nutrition(:); c_environment(:); c_acceptability(:); c_historical(:)];
+        c = [c; c_nutrition(:); c_environment(:); c_acceptability(:)];
     end
 
     % No equality constraints
     ceq = [];
 end
-
